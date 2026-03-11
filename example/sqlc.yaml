@@ -1,0 +1,16 @@
+version: '2'
+plugins:
+  - name: poolroute
+    process:
+      cmd: ../bin/sqlc-gen-poolroute
+sql:
+  - engine: postgresql
+    queries: query.sql
+    schema: schema.sql
+    codegen:
+      - plugin: poolroute
+        out: db
+        options:
+          package: db
+          sql_package: pgx/v5
+          emit_poolroute: true

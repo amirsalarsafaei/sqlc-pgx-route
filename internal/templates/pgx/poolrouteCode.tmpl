@@ -1,0 +1,82 @@
+{{define "poolrouteCodePgx"}}
+
+type PoolRouteQueries struct {
+	reader *Queries
+	writer *Queries
+}
+
+func NewPoolRouteQueries(writer DBTX, reader DBTX) *PoolRouteQueries {
+	if reader == nil {
+		reader = writer
+	}
+	return &PoolRouteQueries{
+		reader: New(reader),
+		writer: New(writer),
+	}
+}
+
+func (poolroute *PoolRouteQueries) WithTx(tx pgx.Tx) *PoolRouteQueries {
+	q := New(tx)
+	return &PoolRouteQueries{
+		reader: q,
+		writer: q,
+	}
+}
+
+{{range .GoQueries}}
+{{- if and (ne .Cmd ":copyfrom") (ne (hasPrefix .Cmd ":batch") true) }}
+
+{{if eq .Cmd ":one"}}
+func (poolroute *PoolRouteQueries) {{.MethodName}}(ctx context.Context, {{.Arg.Pair}}) ({{.Ret.DefineType}}, error) {
+{{- if eq .PoolRouteMode "read" }}
+	return poolroute.reader.{{.MethodName}}({{.Arg.PassArgs}})
+{{- else }}
+	return poolroute.writer.{{.MethodName}}({{.Arg.PassArgs}})
+{{- end }}
+}
+{{end}}
+
+{{if eq .Cmd ":many"}}
+func (poolroute *PoolRouteQueries) {{.MethodName}}(ctx context.Context, {{.Arg.Pair}}) ([]{{.Ret.DefineType}}, error) {
+{{- if eq .PoolRouteMode "read" }}
+	return poolroute.reader.{{.MethodName}}({{.Arg.PassArgs}})
+{{- else }}
+	return poolroute.writer.{{.MethodName}}({{.Arg.PassArgs}})
+{{- end }}
+}
+{{end}}
+
+{{if eq .Cmd ":exec"}}
+func (poolroute *PoolRouteQueries) {{.MethodName}}(ctx context.Context, {{.Arg.Pair}}) error {
+{{- if eq .PoolRouteMode "read" }}
+	return poolroute.reader.{{.MethodName}}({{.Arg.PassArgs}})
+{{- else }}
+	return poolroute.writer.{{.MethodName}}({{.Arg.PassArgs}})
+{{- end }}
+}
+{{end}}
+
+{{if eq .Cmd ":execrows"}}
+func (poolroute *PoolRouteQueries) {{.MethodName}}(ctx context.Context, {{.Arg.Pair}}) (int64, error) {
+{{- if eq .PoolRouteMode "read" }}
+	return poolroute.reader.{{.MethodName}}({{.Arg.PassArgs}})
+{{- else }}
+	return poolroute.writer.{{.MethodName}}({{.Arg.PassArgs}})
+{{- end }}
+}
+{{end}}
+
+{{if eq .Cmd ":execresult"}}
+func (poolroute *PoolRouteQueries) {{.MethodName}}(ctx context.Context, {{.Arg.Pair}}) (pgconn.CommandTag, error) {
+{{- if eq .PoolRouteMode "read" }}
+	return poolroute.reader.{{.MethodName}}({{.Arg.PassArgs}})
+{{- else }}
+	return poolroute.writer.{{.MethodName}}({{.Arg.PassArgs}})
+{{- end }}
+}
+{{end}}
+
+{{- end }}
+{{end}}
+
+{{end}}
