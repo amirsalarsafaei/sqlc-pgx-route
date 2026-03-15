@@ -39,9 +39,6 @@ jobs:
             goarch: arm64
             runner: ubuntu-24.04-arm
           - goos: darwin
-            goarch: amd64
-            runner: macos-13
-          - goos: darwin
             goarch: arm64
             runner: macos-latest
           - goos: windows
@@ -64,9 +61,6 @@ jobs:
         with:
           version: latest
           args: build --single-target --snapshot --clean
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
