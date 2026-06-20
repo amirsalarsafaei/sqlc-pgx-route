@@ -2,10 +2,11 @@
 version: 2
 
 builds:
-  - id: sqlc-gen-poolroute
-    main: ./cmd/sqlc-gen-poolroute
-    binary: sqlc-gen-poolroute
+  - id: sqlc-pgx-route
+    main: ./cmd/sqlc-pgx-route
+    binary: sqlc-pgx-route
     env:
+      # classify uses pg_query_go (libpg_query, cgo) to parse SQL at build time.
       - CGO_ENABLED=1
     goos:
       - linux

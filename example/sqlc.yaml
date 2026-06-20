@@ -1,16 +1,13 @@
 version: '2'
-plugins:
-  - name: poolroute
-    process:
-      cmd: ../bin/sqlc-gen-poolroute
+# sqlc's built-in Go generator (unmodified, always the version of sqlc you run)
+# emits db.go / models.go / query.sql.go. The routing wrapper (poolroute.go) is
+# layered on afterwards by `sqlc-pgx-route ./db` — see gen.go / the Makefile.
 sql:
   - engine: postgresql
     queries: query.sql
     schema: schema.sql
-    codegen:
-      - plugin: poolroute
+    gen:
+      go:
+        package: db
         out: db
-        options:
-          package: db
-          sql_package: pgx/v5
-          emit_poolroute: true
+        sql_package: pgx/v5

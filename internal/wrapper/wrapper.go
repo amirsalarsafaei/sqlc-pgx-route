@@ -1,0 +1,731 @@
+// Package wrapper generates a read/write-routing wrapper around an sqlc-generated
+// *Queries type by reading the already-generated Go source with go/ast.
+//
+// It does NOT fork sqlc: sqlc runs unmodified and emits query.sql.go (which
+// carries both the resolved Go method signatures and the original SQL text).
+// This package then classifies each query and emits poolroute.go.
+//
+// Two sqlc layouts are supported:
+//
+//   - Default: methods use a stored connection (q.db.Query(...)). New(db) takes
+//     a DBTX. The wrapper embeds the writer *Queries (so writes, :copyfrom and
+//     :batch route to the primary for free) and overrides only the read methods
+//     to use a read replica.
+//
+//   - emit_methods_with_db_argument: methods take a db DBTX argument and New()
+//     is empty. The wrapper holds writer and reader DBTX, drops the db argument
+//     from each method, and injects the routed pool per call.
+package wrapper
+
+import (
+	"bytes"
+	"fmt"
+	"go/ast"
+	"go/format"
+	"go/parser"
+	"go/printer"
+	"go/token"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/amirsalarsafaei/pgx-router/classify"
+)
+
+// Config controls generation.
+type Config struct {
+	// Dir is the directory holding the sqlc-generated package.
+	Dir string
+	// OutFile is the file to write within Dir.
+	OutFile string
+	// TypeName is the generated wrapper type name.
+	TypeName string
+	// ConstructorName is the generated constructor name.
+	ConstructorName string
+}
+
+func (c *Config) setDefaults() {
+	if c.OutFile == "" {
+		c.OutFile = "poolroute.go"
+	}
+	if c.TypeName == "" {
+		c.TypeName = "PoolRouteQueries"
+	}
+	if c.ConstructorName == "" {
+		c.ConstructorName = "NewPoolRouteQueries"
+	}
+}
+
+// method is a discovered *Queries method.
+type method struct {
+	name     string
+	params   *ast.FieldList
+	results  *ast.FieldList
+	mode     classify.QueryMode
+	dbIndex  int  // index into params.List of the DBTX argument, or -1
+	hasQuery bool // true if a backing SQL const was found (i.e. routable as read)
+}
+
+type pkg struct {
+	name      string
+	fset      *token.FileSet
+	imports   map[string]importSpec // local name -> import
+	consts    map[string]string     // const name -> SQL text (only `-- name:` consts)
+	methods   []method
+	withTx    *ast.FieldList // WithTx parameter list, if present
+	buildTags string         // `//go:build` expression, if any
+}
+
+type importSpec struct {
+	alias string // "" when no explicit alias
+	path  string
+}
+
+// dbArgMode reports whether sqlc emitted methods that take a db DBTX argument
+// (emit_methods_with_db_argument).
+func (p *pkg) dbArgMode() bool {
+	for _, m := range p.methods {
+		if m.dbIndex >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// Run generates the wrapper file and returns the path written.
+func Run(cfg Config) (string, error) {
+	cfg.setDefaults()
+
+	p, err := loadPackage(cfg)
+	if err != nil {
+		return "", err
+	}
+	if len(p.methods) == 0 {
+		return "", fmt.Errorf("no *Queries methods found in %s — did you run sqlc first?", cfg.Dir)
+	}
+
+	src, err := p.render(cfg)
+	if err != nil {
+		return "", err
+	}
+
+	out := filepath.Join(cfg.Dir, cfg.OutFile)
+	if err := os.WriteFile(out, src, 0o644); err != nil {
+		return "", err
+	}
+	return out, nil
+}
+
+func loadPackage(cfg Config) (*pkg, error) {
+	entries, err := os.ReadDir(cfg.Dir)
+	if err != nil {
+		return nil, fmt.Errorf("reading %s: %w", cfg.Dir, err)
+	}
+
+	fset := token.NewFileSet()
+	var files []*ast.File
+	for _, e := range entries {
+		n := e.Name()
+		if e.IsDir() || n == cfg.OutFile ||
+			!strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, filepath.Join(cfg.Dir, n), nil, parser.ParseComments)
+		if err != nil {
+			return nil, fmt.Errorf("parsing %s: %w", n, err)
+		}
+		files = append(files, f)
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no Go files found in %s", cfg.Dir)
+	}
+
+	p := &pkg{
+		fset:    fset,
+		imports: map[string]importSpec{},
+		consts:  map[string]string{},
+	}
+	for _, f := range files {
+		if p.name == "" {
+			p.name = f.Name.Name
+		} else if p.name != f.Name.Name {
+			return nil, fmt.Errorf("multiple packages in %s (%s, %s); point at a single sqlc output dir", cfg.Dir, p.name, f.Name.Name)
+		}
+		if p.buildTags == "" {
+			p.buildTags = buildConstraint(f)
+		}
+		p.collectImports(f)
+		p.collectConsts(f)
+	}
+	// Collect methods after consts so query classification can resolve.
+	for _, f := range files {
+		p.collectMethods(f)
+	}
+
+	sort.Slice(p.methods, func(i, j int) bool { return p.methods[i].name < p.methods[j].name })
+	return p, nil
+}
+
+func (p *pkg) collectImports(f *ast.File) {
+	for _, imp := range f.Imports {
+		path := strings.Trim(imp.Path.Value, `"`)
+		alias := ""
+		if imp.Name != nil {
+			alias = imp.Name.Name
+		}
+		p.imports[localName(alias, path)] = importSpec{alias: alias, path: path}
+	}
+}
+
+func (p *pkg) collectConsts(f *ast.File) {
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok || len(vs.Names) != 1 || len(vs.Values) != 1 {
+				continue
+			}
+			lit, ok := vs.Values[0].(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				continue
+			}
+			val, err := stringLitValue(lit.Value)
+			if err != nil || !strings.Contains(val, "-- name:") {
+				continue
+			}
+			p.consts[vs.Names[0].Name] = val
+		}
+	}
+}
+
+func (p *pkg) collectMethods(f *ast.File) {
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Recv == nil || len(fn.Recv.List) != 1 {
+			continue
+		}
+		if !isQueriesReceiver(fn.Recv.List[0].Type) {
+			continue
+		}
+		if fn.Name.Name == "WithTx" {
+			p.withTx = fn.Type.Params
+			continue
+		}
+		if !fn.Name.IsExported() {
+			continue
+		}
+		m := method{
+			name:    fn.Name.Name,
+			params:  fn.Type.Params,
+			results: fn.Type.Results,
+			mode:    classify.ModeWrite, // safe default (writes, :copyfrom, :batch)
+			dbIndex: dbArgIndex(fn.Type.Params),
+		}
+		if sql, ok := p.sqlForBody(fn.Body); ok {
+			m.hasQuery = true
+			// rw_mode:/rw: overrides live in the SQL's leading comments, but
+			// sqlc relocates them from the query const into the method's Go doc
+			// comment, so both sources must be consulted.
+			comments := leadingComments(sql)
+			comments = append(comments, docLines(fn.Doc)...)
+			m.mode = classify.Classify(sql, comments)
+		}
+		p.methods = append(p.methods, m)
+	}
+}
+
+// sqlForBody finds the SQL const a method executes by scanning every call in the
+// body for an argument that names a known `-- name:` const. This is robust to
+// the default (q.db.Query), emit_prepared_queries (q.query) and
+// emit_methods_with_db_argument (db.Query) call shapes, as well as
+// emit_exported_queries const names.
+func (p *pkg) sqlForBody(body *ast.BlockStmt) (string, bool) {
+	if body == nil {
+		return "", false
+	}
+	var sql string
+	var found bool
+	ast.Inspect(body, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		for _, arg := range call.Args {
+			ident, ok := arg.(*ast.Ident)
+			if !ok {
+				continue
+			}
+			if v, ok := p.consts[ident.Name]; ok {
+				sql, found = v, true
+				return false
+			}
+		}
+		return true
+	})
+	return sql, found
+}
+
+func (p *pkg) render(cfg Config) ([]byte, error) {
+	if p.dbArgMode() {
+		return p.renderDBArg(cfg)
+	}
+	return p.renderEmbedded(cfg)
+}
+
+// renderEmbedded handles the default sqlc layout: embed the writer *Queries and
+// override only read methods.
+func (p *pkg) renderEmbedded(cfg Config) ([]byte, error) {
+	var reads []method
+	for _, m := range p.methods {
+		if m.hasQuery && m.mode == classify.ModeRead {
+			reads = append(reads, m)
+		}
+	}
+
+	used := map[string]bool{}
+	for _, m := range reads {
+		p.collectUsedNames(m.params, used)
+		p.collectUsedNames(m.results, used)
+	}
+	if p.withTx != nil {
+		p.collectUsedNames(p.withTx, used)
+	}
+
+	var b bytes.Buffer
+	p.header(&b, used)
+
+	fmt.Fprintf(&b, "// %s routes read queries to a read replica and everything\n", cfg.TypeName)
+	fmt.Fprintf(&b, "// else (writes, :copyfrom, :batch) to the primary. The embedded *Queries is\n")
+	fmt.Fprintf(&b, "// the primary/writer; only read methods are overridden below.\n")
+	fmt.Fprintf(&b, "type %s struct {\n", cfg.TypeName)
+	fmt.Fprintf(&b, "\t*Queries\n")
+	fmt.Fprintf(&b, "\treader *Queries\n")
+	fmt.Fprintf(&b, "}\n\n")
+
+	fmt.Fprintf(&b, "// %s builds a %s. When reader is nil all queries use writer.\n", cfg.ConstructorName, cfg.TypeName)
+	fmt.Fprintf(&b, "func %s(writer DBTX, reader DBTX) *%s {\n", cfg.ConstructorName, cfg.TypeName)
+	fmt.Fprintf(&b, "\tif reader == nil {\n\t\treader = writer\n\t}\n")
+	fmt.Fprintf(&b, "\treturn &%s{Queries: New(writer), reader: New(reader)}\n", cfg.TypeName)
+	fmt.Fprintf(&b, "}\n\n")
+
+	if p.withTx != nil {
+		txType, txName := p.txParam()
+		fmt.Fprintf(&b, "// WithTx runs every query on tx; a transaction is pinned to one connection,\n")
+		fmt.Fprintf(&b, "// so reads and writes cannot be split across pools.\n")
+		fmt.Fprintf(&b, "func (q *%s) WithTx(%s %s) *%s {\n", cfg.TypeName, txName, txType, cfg.TypeName)
+		fmt.Fprintf(&b, "\tqq := New(%s)\n", txName)
+		fmt.Fprintf(&b, "\treturn &%s{Queries: qq, reader: qq}\n", cfg.TypeName)
+		fmt.Fprintf(&b, "}\n\n")
+	}
+
+	for _, m := range reads {
+		sig, err := p.signature(m.params, m.results)
+		if err != nil {
+			return nil, err
+		}
+		fmt.Fprintf(&b, "func (q *%s) %s%s {\n", cfg.TypeName, m.name, sig)
+		fmt.Fprintf(&b, "\treturn q.reader.%s(%s)\n", m.name, strings.Join(paramNames(m.params), ", "))
+		fmt.Fprintf(&b, "}\n\n")
+	}
+
+	return format.Source(b.Bytes())
+}
+
+// renderDBArg handles emit_methods_with_db_argument: drop the db argument and
+// inject the routed pool per call.
+func (p *pkg) renderDBArg(cfg Config) ([]byte, error) {
+	var wrapped []method
+	for _, m := range p.methods {
+		if m.dbIndex >= 0 {
+			wrapped = append(wrapped, m)
+		}
+	}
+
+	used := map[string]bool{}
+	for _, m := range wrapped {
+		p.collectUsedNamesExcept(m.params, m.dbIndex, used)
+		p.collectUsedNames(m.results, used)
+	}
+
+	var b bytes.Buffer
+	p.header(&b, used)
+
+	fmt.Fprintf(&b, "// %s routes read queries to a read replica and everything\n", cfg.TypeName)
+	fmt.Fprintf(&b, "// else (writes, :copyfrom, :batch) to the primary, injecting the chosen pool\n")
+	fmt.Fprintf(&b, "// into each sqlc method (generated with emit_methods_with_db_argument).\n")
+	fmt.Fprintf(&b, "type %s struct {\n", cfg.TypeName)
+	fmt.Fprintf(&b, "\t*Queries\n")
+	fmt.Fprintf(&b, "\twriter DBTX\n")
+	fmt.Fprintf(&b, "\treader DBTX\n")
+	fmt.Fprintf(&b, "}\n\n")
+
+	fmt.Fprintf(&b, "// %s builds a %s. When reader is nil all queries use writer.\n", cfg.ConstructorName, cfg.TypeName)
+	fmt.Fprintf(&b, "func %s(writer DBTX, reader DBTX) *%s {\n", cfg.ConstructorName, cfg.TypeName)
+	fmt.Fprintf(&b, "\tif reader == nil {\n\t\treader = writer\n\t}\n")
+	fmt.Fprintf(&b, "\treturn &%s{Queries: New(), writer: writer, reader: reader}\n", cfg.TypeName)
+	fmt.Fprintf(&b, "}\n\n")
+
+	for _, m := range wrapped {
+		sig, err := p.signatureExcept(m.params, m.dbIndex, m.results)
+		if err != nil {
+			return nil, err
+		}
+		pool := "q.writer"
+		if m.mode == classify.ModeRead {
+			pool = "q.reader"
+		}
+		fmt.Fprintf(&b, "func (q *%s) %s%s {\n", cfg.TypeName, m.name, sig)
+		fmt.Fprintf(&b, "\treturn q.Queries.%s(%s)\n", m.name, strings.Join(callArgsWithPool(m.params, m.dbIndex, pool), ", "))
+		fmt.Fprintf(&b, "}\n\n")
+	}
+
+	return format.Source(b.Bytes())
+}
+
+func (p *pkg) header(b *bytes.Buffer, used map[string]bool) {
+	if p.buildTags != "" {
+		fmt.Fprintf(b, "//go:build %s\n\n", p.buildTags)
+	}
+	fmt.Fprintf(b, "// Code generated by sqlc-pgx-route. DO NOT EDIT.\n\n")
+	fmt.Fprintf(b, "package %s\n\n", p.name)
+	if imports := p.renderImports(used); imports != "" {
+		b.WriteString(imports)
+		b.WriteString("\n")
+	}
+}
+
+// signature renders "(params) results".
+func (p *pkg) signature(params, results *ast.FieldList) (string, error) {
+	return p.signatureExcept(params, -1, results)
+}
+
+// signatureExcept renders "(params) results", omitting the param field at
+// excludeIdx (used to drop the db argument).
+func (p *pkg) signatureExcept(params *ast.FieldList, excludeIdx int, results *ast.FieldList) (string, error) {
+	ps, err := p.printParams(params, excludeIdx)
+	if err != nil {
+		return "", err
+	}
+	rs, err := p.printResults(results)
+	if err != nil {
+		return "", err
+	}
+	if rs != "" {
+		return ps + " " + rs, nil
+	}
+	return ps, nil
+}
+
+func (p *pkg) printParams(fl *ast.FieldList, excludeIdx int) (string, error) {
+	if fl == nil {
+		return "()", nil
+	}
+	var parts []string
+	for i, f := range fl.List {
+		if i == excludeIdx {
+			continue
+		}
+		typeStr, err := p.printNode(f.Type)
+		if err != nil {
+			return "", err
+		}
+		if len(f.Names) > 0 {
+			var ns []string
+			for _, n := range f.Names {
+				ns = append(ns, n.Name)
+			}
+			parts = append(parts, strings.Join(ns, ", ")+" "+typeStr)
+		} else {
+			parts = append(parts, typeStr)
+		}
+	}
+	return "(" + strings.Join(parts, ", ") + ")", nil
+}
+
+func (p *pkg) printResults(fl *ast.FieldList) (string, error) {
+	if fl == nil || len(fl.List) == 0 {
+		return "", nil
+	}
+	if len(fl.List) == 1 && len(fl.List[0].Names) == 0 {
+		return p.printNode(fl.List[0].Type)
+	}
+	var parts []string
+	for _, f := range fl.List {
+		typeStr, err := p.printNode(f.Type)
+		if err != nil {
+			return "", err
+		}
+		if len(f.Names) > 0 {
+			var ns []string
+			for _, n := range f.Names {
+				ns = append(ns, n.Name)
+			}
+			parts = append(parts, strings.Join(ns, ", ")+" "+typeStr)
+		} else {
+			parts = append(parts, typeStr)
+		}
+	}
+	return "(" + strings.Join(parts, ", ") + ")", nil
+}
+
+func (p *pkg) printNode(n ast.Node) (string, error) {
+	var b bytes.Buffer
+	if err := printer.Fprint(&b, p.fset, n); err != nil {
+		return "", err
+	}
+	return b.String(), nil
+}
+
+func (p *pkg) txParam() (typeStr, name string) {
+	name, typeStr = "tx", "pgx.Tx"
+	if p.withTx != nil && len(p.withTx.List) == 1 {
+		f := p.withTx.List[0]
+		if s, err := p.printNode(f.Type); err == nil {
+			typeStr = s
+		}
+		if len(f.Names) == 1 {
+			name = f.Names[0].Name
+		}
+	}
+	return typeStr, name
+}
+
+func (p *pkg) collectUsedNames(fl *ast.FieldList, used map[string]bool) {
+	p.collectUsedNamesExcept(fl, -1, used)
+}
+
+func (p *pkg) collectUsedNamesExcept(fl *ast.FieldList, excludeIdx int, used map[string]bool) {
+	if fl == nil {
+		return
+	}
+	for i, f := range fl.List {
+		if i == excludeIdx {
+			continue
+		}
+		ast.Inspect(f.Type, func(n ast.Node) bool {
+			if sel, ok := n.(*ast.SelectorExpr); ok {
+				if id, ok := sel.X.(*ast.Ident); ok {
+					used[id.Name] = true
+				}
+			}
+			return true
+		})
+	}
+}
+
+func (p *pkg) renderImports(used map[string]bool) string {
+	var specs []importSpec
+	seen := map[string]bool{}
+	for name := range used {
+		imp, ok := p.imports[name]
+		if !ok {
+			continue
+		}
+		if seen[imp.path] {
+			continue
+		}
+		seen[imp.path] = true
+		specs = append(specs, imp)
+	}
+	if len(specs) == 0 {
+		return ""
+	}
+
+	// Group standard-library imports separately from third-party ones, each
+	// group sorted, matching the conventional gofmt/goimports layout.
+	var std, third []importSpec
+	for _, s := range specs {
+		if isStdlib(s.path) {
+			std = append(std, s)
+		} else {
+			third = append(third, s)
+		}
+	}
+	byPath := func(s []importSpec) { sort.Slice(s, func(i, j int) bool { return s[i].path < s[j].path }) }
+	byPath(std)
+	byPath(third)
+
+	var b strings.Builder
+	b.WriteString("import (\n")
+	writeGroup := func(group []importSpec, leadingBlank bool) {
+		if len(group) == 0 {
+			return
+		}
+		if leadingBlank {
+			b.WriteString("\n")
+		}
+		for _, s := range group {
+			if s.alias != "" {
+				fmt.Fprintf(&b, "\t%s %q\n", s.alias, s.path)
+			} else {
+				fmt.Fprintf(&b, "\t%q\n", s.path)
+			}
+		}
+	}
+	writeGroup(std, false)
+	writeGroup(third, len(std) > 0)
+	b.WriteString(")\n")
+	return b.String()
+}
+
+// callArgsWithPool builds the argument list to forward to the embedded method,
+// substituting the db argument (at dbIndex) with the chosen pool expression.
+func callArgsWithPool(fl *ast.FieldList, dbIndex int, pool string) []string {
+	if fl == nil {
+		return nil
+	}
+	var args []string
+	for i, f := range fl.List {
+		if i == dbIndex {
+			args = append(args, pool)
+			continue
+		}
+		for _, n := range f.Names {
+			args = append(args, n.Name)
+		}
+	}
+	return args
+}
+
+func paramNames(fl *ast.FieldList) []string {
+	if fl == nil {
+		return nil
+	}
+	var names []string
+	for _, f := range fl.List {
+		for _, n := range f.Names {
+			names = append(names, n.Name)
+		}
+	}
+	return names
+}
+
+// dbArgIndex returns the index of the param field whose type is the in-package
+// DBTX interface, or -1 if there is none.
+func dbArgIndex(fl *ast.FieldList) int {
+	if fl == nil {
+		return -1
+	}
+	for i, f := range fl.List {
+		if id, ok := f.Type.(*ast.Ident); ok && id.Name == "DBTX" {
+			return i
+		}
+	}
+	return -1
+}
+
+func isQueriesReceiver(expr ast.Expr) bool {
+	star, ok := expr.(*ast.StarExpr)
+	if !ok {
+		return false
+	}
+	id, ok := star.X.(*ast.Ident)
+	return ok && id.Name == "Queries"
+}
+
+// buildConstraint returns the `//go:build` expression for a file, or "".
+func buildConstraint(f *ast.File) string {
+	for _, cg := range f.Comments {
+		for _, c := range cg.List {
+			if expr, ok := strings.CutPrefix(c.Text, "//go:build "); ok {
+				return strings.TrimSpace(expr)
+			}
+		}
+	}
+	return ""
+}
+
+// localName returns the identifier a package is referenced by: the alias if
+// present, otherwise the package's real name inferred from its import path.
+func localName(alias, path string) string {
+	if alias != "" {
+		return alias
+	}
+	return packageNameFromPath(path)
+}
+
+// packageNameFromPath infers an import's package name from its path. The last
+// path element is correct except for versioned module paths (".../v5"), where
+// the element before the version is the package name.
+func packageNameFromPath(path string) string {
+	parts := strings.Split(path, "/")
+	last := parts[len(parts)-1]
+	if isMajorVersion(last) && len(parts) >= 2 {
+		return parts[len(parts)-2]
+	}
+	return last
+}
+
+// isStdlib reports whether an import path belongs to the standard library
+// (its first path segment contains no dot, e.g. "context", "net/http").
+func isStdlib(path string) bool {
+	first, _, _ := strings.Cut(path, "/")
+	return !strings.Contains(first, ".")
+}
+
+func isMajorVersion(s string) bool {
+	if len(s) < 2 || s[0] != 'v' {
+		return false
+	}
+	for _, r := range s[1:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// leadingComments mirrors how the runtime router extracts comment overrides
+// (e.g. `-- rw_mode:write`) from the head of a query.
+func leadingComments(sql string) []string {
+	var comments []string
+	s := strings.TrimSpace(sql)
+	for {
+		switch {
+		case strings.HasPrefix(s, "--"):
+			end := strings.IndexByte(s, '\n')
+			if end == -1 {
+				return append(comments, s)
+			}
+			comments = append(comments, s[:end])
+			s = strings.TrimSpace(s[end+1:])
+		case strings.HasPrefix(s, "/*"):
+			end := strings.Index(s, "*/")
+			if end == -1 {
+				return append(comments, s)
+			}
+			comments = append(comments, s[:end+2])
+			s = strings.TrimSpace(s[end+2:])
+		default:
+			return comments
+		}
+	}
+}
+
+// docLines returns the comment-marker-stripped lines of a doc comment group.
+func docLines(doc *ast.CommentGroup) []string {
+	if doc == nil {
+		return nil
+	}
+	text := strings.TrimRight(doc.Text(), "\n")
+	if text == "" {
+		return nil
+	}
+	return strings.Split(text, "\n")
+}
+
+// stringLitValue unquotes a Go string literal (regular or raw).
+func stringLitValue(lit string) (string, error) {
+	if len(lit) >= 2 && lit[0] == '`' && lit[len(lit)-1] == '`' {
+		return lit[1 : len(lit)-1], nil
+	}
+	return strconv.Unquote(lit)
+}
