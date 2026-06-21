@@ -245,12 +245,23 @@ func (p *pkg) collectMethods(f *ast.File) {
 		}
 		if sql, ok := p.sqlForBody(fn.Body); ok {
 			m.hasQuery = true
-			// rw_mode:/rw: overrides live in the SQL's leading comments, but
-			// sqlc relocates them from the query const into the method's Go doc
-			// comment, so both sources must be consulted.
-			comments := leadingComments(sql)
-			comments = append(comments, docLines(fn.Doc)...)
-			m.mode = classify.Classify(sql, comments)
+			switch {
+			case bodyCalls(fn.Body, "SendBatch"):
+				// A :batch* method (:batchexec/:batchmany/:batchone) queues
+				// several statements onto one pgx.Batch and sends them on a
+				// single connection, so it cannot be split across pools. It
+				// always routes to the primary, regardless of the underlying
+				// statement kind — without this, a :batchmany over a SELECT
+				// would be misclassified as a plain read and sent to a replica.
+				m.mode = classify.ModeWrite
+			default:
+				// rw_mode:/rw: overrides live in the SQL's leading comments, but
+				// sqlc relocates them from the query const into the method's Go
+				// doc comment, so both sources must be consulted.
+				comments := leadingComments(sql)
+				comments = append(comments, docLines(fn.Doc)...)
+				m.mode = classify.Classify(sql, comments)
+			}
 		}
 		p.methods = append(p.methods, m)
 	}
@@ -288,6 +299,32 @@ func (p *pkg) sqlForBody(body *ast.BlockStmt) (string, bool) {
 		return true
 	})
 	return sql, found
+}
+
+// bodyCalls reports whether body contains a call to a method named sel
+// (e.g. db.SendBatch(...), q.db.SendBatch(...)). It is used to recognize sqlc
+// call shapes — like :batch* methods — by the API they invoke rather than by a
+// brittle method-name or generator-version heuristic.
+func bodyCalls(body *ast.BlockStmt, sel string) bool {
+	if body == nil {
+		return false
+	}
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if s, ok := call.Fun.(*ast.SelectorExpr); ok && s.Sel.Name == sel {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 func (p *pkg) render(cfg Config) ([]byte, error) {

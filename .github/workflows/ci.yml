@@ -43,3 +43,23 @@ jobs:
 
       - name: Build
         run: go build ./...
+
+  integration:
+    name: Integration (routing)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      # Spins up two Postgres containers (primary + replica) and asserts the
+      # generated wrapper routes reads/writes correctly. Docker is available on
+      # ubuntu-latest runners.
+      - name: Routing integration tests
+        run: cd example && go test -tags integration ./...

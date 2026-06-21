@@ -77,6 +77,10 @@ SELECT slow_immutable_fn(id) FROM authors WHERE id = $1;  -- force a write-class
 - `-- rw:write` (or `-- rw_mode:write`) → force to the **primary**.
 - `-- rw:read` (or `-- rw_mode:read`) → force to the **replica**.
 
+`:copyfrom` and `:batch*` queries are the one exception: they always run on the
+primary (a batch is sent on a single connection and can't be split across
+pools), so `rw:read` does not move them to a replica.
+
 That's the whole override mechanism: edit the `.sql`, re-run generation, done.
 You never edit generated Go. (Under the hood sqlc moves the comment onto the
 generated method's doc comment, and the tool reads it there.)
@@ -184,6 +188,21 @@ The tool reads whatever sqlc emits, so it adapts to the Go generator's options:
 | `emit_result_struct_pointers` / pointer params | Signatures are reproduced verbatim. |
 | `build_tags` | The `//go:build` constraint is propagated to `poolroute.go`. |
 | `output_*_file_name`, tags, JSON/DB tags | Transparent (the whole package is scanned). |
+
+## Verifying routing
+
+An integration test in [`example/db`](example/db/routing_integration_test.go)
+proves the generated wrapper routes correctly against **real PostgreSQL**. It
+starts two containers — a "primary" and a "replica" — seeded with *divergent*
+data for the same row (so the destination of each query is observable), then
+asserts that plain `SELECT`s hit the replica while writes, `SELECT … FOR UPDATE`,
+and `rw:write` overrides hit the primary, and that a read never sees a
+primary-only write.
+
+```bash
+make test-integration          # requires Docker
+# or: cd example && go test -tags integration ./...
+```
 
 ## Notes / limitations
 

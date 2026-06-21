@@ -241,6 +241,163 @@ func (q *Queries) CreateAuthor(ctx context.Context, db DBTX, arg CreateAuthorPar
 	mustNotContain(t, src, "db DBTX, id int64")
 }
 
+// batchDB is db.go for a package that uses pgx batches: DBTX gains a SendBatch
+// method and there is a minimal batch type with Queue. It stands in for the
+// shape sqlc emits in batch.go when a query is annotated :batchexec/:batchmany/
+// :batchone.
+const batchDB = genHeader + `package db
+
+import "context"
+
+type pgxBatch struct{}
+
+func (b *pgxBatch) Queue(query string, args ...any) {}
+
+type batchResults interface{ Close() error }
+
+type DBTX interface {
+	Exec(context.Context, string, ...any) error
+	Query(context.Context, string, ...any) error
+	QueryRow(context.Context, string, ...any) error
+	SendBatch(context.Context, *pgxBatch) batchResults
+}
+
+func New(db DBTX) *Queries { return &Queries{db: db} }
+
+type Queries struct{ db DBTX }
+
+type Author struct {
+	ID   int64
+	Name string
+}
+`
+
+func TestBatchRoutesToPrimary(t *testing.T) {
+	// A :batchmany over a plain SELECT must NOT be routed to the replica: a batch
+	// queues several statements onto one connection and can't be split, so it
+	// always runs on the primary. The batch method's body queues the SQL const
+	// and calls SendBatch — the same shape sqlc generates — so a naive "this body
+	// references a SELECT const" check would wrongly send it to a replica.
+	query := genHeader + `package db
+
+import "context"
+
+const getAuthor = ` + "`" + `-- name: GetAuthor :one
+SELECT id, name FROM authors WHERE id = $1` + "`" + `
+
+func (q *Queries) GetAuthor(ctx context.Context, id int64) (Author, error) {
+	_ = q.db.QueryRow(ctx, getAuthor, id)
+	return Author{}, nil
+}
+
+const getAuthorsBatch = ` + "`" + `-- name: GetAuthorsBatch :batchmany
+SELECT id, name FROM authors WHERE id = $1` + "`" + `
+
+type GetAuthorsBatchBatchResults struct{ br batchResults }
+
+func (q *Queries) GetAuthorsBatch(ctx context.Context, ids []int64) *GetAuthorsBatchBatchResults {
+	b := &pgxBatch{}
+	for range ids {
+		b.Queue(getAuthorsBatch)
+	}
+	br := q.db.SendBatch(ctx, b)
+	return &GetAuthorsBatchBatchResults{br: br}
+}
+`
+	// A hand-written Querier (no sqlc header): the wrapper must still satisfy it
+	// even though it does NOT override the batch method — it inherits it from the
+	// embedded writer *Queries, which is exactly what sends the batch to the
+	// primary.
+	querier := `package db
+
+import "context"
+
+type Querier interface {
+	GetAuthor(ctx context.Context, id int64) (Author, error)
+	GetAuthorsBatch(ctx context.Context, ids []int64) *GetAuthorsBatchBatchResults
+}
+
+var _ Querier = (*PoolRouteQueries)(nil)
+`
+	src := genAndBuild(t, map[string]string{
+		"db.go":        batchDB,
+		"query.sql.go": query,
+		"querier.go":   querier,
+	})
+
+	// The plain read is overridden to the replica...
+	mustContain(t, src, "return q.reader.GetAuthor(ctx, id)")
+	// ...but the batch method is left to the embedded writer, never the replica.
+	mustNotContain(t, src, "func (q *PoolRouteQueries) GetAuthorsBatch")
+	mustNotContain(t, src, "reader.GetAuthorsBatch")
+}
+
+func TestBatchRoutesToPrimaryDBArg(t *testing.T) {
+	// Same invariant under emit_methods_with_db_argument: the batch method is
+	// wrapped (its db argument is dropped) but the injected pool is the writer,
+	// not the reader.
+	db := genHeader + `package db
+
+import "context"
+
+type pgxBatch struct{}
+
+func (b *pgxBatch) Queue(query string, args ...any) {}
+
+type batchResults interface{ Close() error }
+
+type DBTX interface {
+	Exec(context.Context, string, ...any) error
+	Query(context.Context, string, ...any) error
+	QueryRow(context.Context, string, ...any) error
+	SendBatch(context.Context, *pgxBatch) batchResults
+}
+
+func New() *Queries { return &Queries{} }
+
+type Queries struct{}
+
+type Author struct {
+	ID   int64
+	Name string
+}
+`
+	query := genHeader + `package db
+
+import "context"
+
+const getAuthor = ` + "`" + `-- name: GetAuthor :one
+SELECT id, name FROM authors WHERE id = $1` + "`" + `
+
+func (q *Queries) GetAuthor(ctx context.Context, db DBTX, id int64) (Author, error) {
+	_ = db.QueryRow(ctx, getAuthor, id)
+	return Author{}, nil
+}
+
+const getAuthorsBatch = ` + "`" + `-- name: GetAuthorsBatch :batchmany
+SELECT id, name FROM authors WHERE id = $1` + "`" + `
+
+type GetAuthorsBatchBatchResults struct{ br batchResults }
+
+func (q *Queries) GetAuthorsBatch(ctx context.Context, db DBTX, ids []int64) *GetAuthorsBatchBatchResults {
+	b := &pgxBatch{}
+	for range ids {
+		b.Queue(getAuthorsBatch)
+	}
+	br := db.SendBatch(ctx, b)
+	return &GetAuthorsBatchBatchResults{br: br}
+}
+`
+	src := genAndBuild(t, map[string]string{
+		"db.go":        db,
+		"query.sql.go": query,
+	})
+
+	mustContain(t, src, "return q.Queries.GetAuthor(ctx, q.reader, id)")
+	mustContain(t, src, "return q.Queries.GetAuthorsBatch(ctx, q.writer, ids)")
+	mustNotContain(t, src, "GetAuthorsBatch(ctx, q.reader")
+}
+
 func TestExportedConsts(t *testing.T) {
 	// emit_exported_queries: const names are exported. Classification keys off
 	// the SQL value, not the const name, so this must still work.
